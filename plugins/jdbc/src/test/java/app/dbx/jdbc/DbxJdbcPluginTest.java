@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
@@ -45,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class DbxJdbcPluginTest {
@@ -3675,6 +3677,38 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void zenithListSchemasFallsBackToLoginUserWithoutDbUsers() throws Exception {
+        Method listSchemas = DbxJdbcPlugin.class.getDeclaredMethod("zenithListSchemas", Connection.class);
+        listSchemas.setAccessible(true);
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:dbx_zenith_no_users;DB_CLOSE_DELAY=-1", "sa", "")) {
+            JsonNode schemas = (JsonNode) listSchemas.invoke(null, conn);
+            assertEquals(List.of("SA"), MAPPER.convertValue(schemas, List.class));
+        }
+    }
+
+    @Test
+    void zenithSchemaFallbackRejectsBlankUserAndKeepsOriginalError() throws Exception {
+        Method listSchemas = DbxJdbcPlugin.class.getDeclaredMethod("zenithListSchemas", Connection.class);
+        listSchemas.setAccessible(true);
+        Method effectiveSchema = DbxJdbcPlugin.class.getDeclaredMethod("zenithEffectiveSchema", Connection.class, String.class);
+        effectiveSchema.setAccessible(true);
+        Connection conn = zenithFailingConnection("");
+
+        InvocationTargetException blank = assertThrows(
+            InvocationTargetException.class,
+            () -> effectiveSchema.invoke(null, conn, null)
+        );
+        assertTrue(blank.getCause().getMessage().contains("Unable to determine the current Zenith user"));
+
+        InvocationTargetException listed = assertThrows(InvocationTargetException.class, () -> listSchemas.invoke(null, conn));
+        SQLException original = (SQLException) listed.getCause();
+        assertTrue(original.getMessage().contains("DB_USERS"));
+        assertEquals(1, original.getSuppressed().length);
+        assertTrue(original.getSuppressed()[0].getMessage().contains("Unable to determine the current Zenith user"));
+    }
+
+    @Test
     void zenithListObjectsReadsDbViewsPerSchema() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod("zenithListObjects", Connection.class, String.class, String.class);
         method.setAccessible(true);
@@ -3811,6 +3845,10 @@ final class DbxJdbcPluginTest {
             conn.createStatement().execute(
                 "INSERT INTO DB_PROCEDURES VALUES ('APP_USER', 'F_CALC', 'FUNCTION', 'CREATE OR REPLACE FUNCTION F_CALC RETURN INT')"
             );
+            // A same-named procedure must not be returned for a FUNCTION request, and vice versa.
+            conn.createStatement().execute(
+                "INSERT INTO DB_PROCEDURES VALUES ('APP_USER', 'F_CALC', 'PROCEDURE', 'CREATE OR REPLACE PROCEDURE F_CALC')"
+            );
 
             JsonNode view = (JsonNode) method.invoke(null, conn, "APP_USER", "V_ORDERS", "VIEW");
             assertEquals("CREATE OR REPLACE VIEW \"APP_USER\".\"V_ORDERS\" AS\nSELECT SEQ_NO FROM ORDERS", view.path("source").asText());
@@ -3818,6 +3856,9 @@ final class DbxJdbcPluginTest {
 
             JsonNode function = (JsonNode) method.invoke(null, conn, "APP_USER", "F_CALC", "FUNCTION");
             assertEquals("CREATE OR REPLACE FUNCTION F_CALC RETURN INT", function.path("source").asText());
+
+            JsonNode procedure = (JsonNode) method.invoke(null, conn, "APP_USER", "F_CALC", "PROCEDURE");
+            assertEquals("CREATE OR REPLACE PROCEDURE F_CALC", procedure.path("source").asText());
         }
     }
 
@@ -3940,6 +3981,37 @@ final class DbxJdbcPluginTest {
                     case "getColumnTypeName" -> typeName;
                     default -> defaultValue(method.getReturnType());
                 };
+            }
+        );
+    }
+
+    /** A connection whose every query fails, mimicking a Zenith login without dictionary or DUAL access. */
+    private static Connection zenithFailingConnection(String userName) {
+        Statement statement = (Statement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Statement.class },
+            (proxy, method, args) -> {
+                if ("executeQuery".equals(method.getName())) {
+                    throw new SQLException("Query failed: " + args[0]);
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getUserName" -> userName;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "createStatement" -> statement;
+                case "getMetaData" -> metadata;
+                default -> defaultValue(method.getReturnType());
             }
         );
     }

@@ -3969,7 +3969,11 @@ public final class DbxJdbcPlugin {
         } catch (SQLException ignored) {
         }
         String username = conn.getMetaData().getUserName();
-        return username == null || username.isBlank() ? username : zenithResolveOwner(conn, username);
+        if (username == null || username.isBlank()) {
+            // An empty owner would make every dictionary query silently return nothing.
+            throw new SQLException("Unable to determine the current Zenith user; specify a schema explicitly");
+        }
+        return zenithResolveOwner(conn, username);
     }
 
     private static String zenithResolveOwner(Connection conn, String owner) throws SQLException {
@@ -4004,11 +4008,13 @@ public final class DbxJdbcPlugin {
             }
         } catch (SQLException e) {
             // Without DB_USERS access the login user's own schema is still browsable.
-            String current = zenithEffectiveSchema(conn, null);
-            if (current == null || current.isBlank()) {
+            // If that fallback fails too, report the original DB_USERS error.
+            try {
+                result.add(zenithEffectiveSchema(conn, null));
+            } catch (SQLException fallback) {
+                e.addSuppressed(fallback);
                 throw e;
             }
-            result.add(current);
         }
         return result;
     }
@@ -4249,9 +4255,10 @@ public final class DbxJdbcPlugin {
             // DB_SOURCE.LINE is NULL on Zenith, so the routine body must come from DB_PROCEDURES.SOURCE.
             source = zenithSingleText(
                 conn,
-                "SELECT SOURCE FROM DB_PROCEDURES WHERE OWNER = ? AND OBJECT_NAME = ? AND OBJECT_TYPE = '" + normalizedType + "'",
+                "SELECT SOURCE FROM DB_PROCEDURES WHERE OWNER = ? AND OBJECT_NAME = ? AND OBJECT_TYPE = ?",
                 owner,
-                stripRoutineSignature(name)
+                stripRoutineSignature(name),
+                normalizedType
             );
         } else {
             throw new SQLException("Object source is not supported by this JDBC driver");
@@ -4266,10 +4273,11 @@ public final class DbxJdbcPlugin {
         return item;
     }
 
-    private static String zenithSingleText(Connection conn, String sql, String owner, String name) throws SQLException {
+    private static String zenithSingleText(Connection conn, String sql, String... params) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, owner);
-            ps.setString(2, name);
+            for (int i = 0; i < params.length; i++) {
+                ps.setString(i + 1, params[i]);
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
                     throw new SQLException("Object source not found");
