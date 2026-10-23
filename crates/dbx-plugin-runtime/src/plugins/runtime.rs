@@ -1266,6 +1266,7 @@ mod tests {
         UserInputSpec, USER_INPUT_DEFAULT_TIMEOUT, USER_INPUT_MAX_OPTIONS, USER_INPUT_MAX_TIMEOUT,
         USER_INPUT_MIN_TIMEOUT,
     };
+    use super::{plugin_stderr_hint, PLUGIN_JAVA_TOO_OLD_MESSAGE};
     #[cfg(unix)]
     use super::{PluginSessionState, PluginSidecarSession};
     #[cfg(unix)]
