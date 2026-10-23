@@ -3639,6 +3639,194 @@ final class DbxJdbcPluginTest {
         }
     }
 
+    @Test
+    void zenithConnectionIsDetectedByUrlOrDriverClass() throws Exception {
+        assertTrue(DbxJdbcPlugin.isZenithConnection(MAPPER.readTree("""
+            { "connection_string": "JDBC:Zenith:@192.0.2.10:1888" }
+            """)));
+        assertTrue(DbxJdbcPlugin.isZenithConnection(MAPPER.readTree("""
+            { "connection_string": "jdbc:wrapped:x", "jdbc_driver_class": " com.huawei.gauss.jdbc.ZenithDriver " }
+            """)));
+        assertFalse(DbxJdbcPlugin.isZenithConnection(MAPPER.readTree("""
+            { "connection_string": "jdbc:oracle:thin:@//db:1521/ORCL" }
+            """)));
+        assertFalse(DbxJdbcPlugin.isZenithConnection(MAPPER.readTree("""
+            { "connection_string": "jdbc:gaussdb://db:8000/postgres", "jdbc_driver_class": "com.huawei.gaussdb.jdbc.Driver" }
+            """)));
+    }
+
+    @Test
+    void zenithListsSchemasFromDbUsersAndDefaultsToLoginUser() throws Exception {
+        Method listSchemas = DbxJdbcPlugin.class.getDeclaredMethod("zenithListSchemas", Connection.class);
+        listSchemas.setAccessible(true);
+        Method effectiveSchema = DbxJdbcPlugin.class.getDeclaredMethod("zenithEffectiveSchema", Connection.class, String.class);
+        effectiveSchema.setAccessible(true);
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:dbx_zenith_users;DB_CLOSE_DELAY=-1", "sa", "")) {
+            conn.createStatement().execute("CREATE TABLE DB_USERS (USERNAME VARCHAR(64))");
+            conn.createStatement().execute("INSERT INTO DB_USERS(USERNAME) VALUES ('SYS'), ('APP_USER'), ('APP_USER_ARCHIVE')");
+
+            JsonNode schemas = (JsonNode) listSchemas.invoke(null, conn);
+            assertEquals(List.of("APP_USER", "APP_USER_ARCHIVE", "SYS"), MAPPER.convertValue(schemas, List.class));
+            assertEquals("APP_USER", effectiveSchema.invoke(null, conn, "app_user"));
+            // Connection.getSchema() is unimplemented by the driver; the login user comes from SELECT USER FROM DUAL.
+            assertEquals("SA", effectiveSchema.invoke(null, conn, ""));
+        }
+    }
+
+    @Test
+    void zenithListObjectsReadsDbViewsPerSchema() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("zenithListObjects", Connection.class, String.class, String.class);
+        method.setAccessible(true);
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:dbx_zenith_objects;DB_CLOSE_DELAY=-1", "sa", "")) {
+            conn.createStatement().execute("CREATE TABLE DB_TABLES (OWNER VARCHAR(64), TABLE_NAME VARCHAR(64))");
+            conn.createStatement().execute("CREATE TABLE DB_VIEWS (OWNER VARCHAR(64), VIEW_NAME VARCHAR(64), TEXT VARCHAR(256))");
+            conn.createStatement().execute(
+                "CREATE TABLE DB_TAB_COMMENTS (OWNER VARCHAR(64), TABLE_NAME VARCHAR(64), TABLE_TYPE VARCHAR(16), COMMENTS VARCHAR(128))"
+            );
+            conn.createStatement().execute(
+                "CREATE TABLE DB_PROCEDURES (OWNER VARCHAR(64), OBJECT_NAME VARCHAR(64), PROCEDURE_NAME VARCHAR(64), OBJECT_TYPE VARCHAR(16), SOURCE VARCHAR(256))"
+            );
+            conn.createStatement().execute("CREATE TABLE DB_SEQUENCES (SEQUENCE_OWNER VARCHAR(64), SEQUENCE_NAME VARCHAR(64))");
+            conn.createStatement().execute(
+                "INSERT INTO DB_TABLES VALUES ('APP_USER', 'ORDERS'), ('OTHER', 'NOT_MINE')"
+            );
+            conn.createStatement().execute("INSERT INTO DB_VIEWS VALUES ('APP_USER', 'V_ORDERS', 'SELECT 1 FROM DUAL')");
+            conn.createStatement().execute("INSERT INTO DB_TAB_COMMENTS VALUES ('APP_USER', 'ORDERS', 'TABLE', '订单')");
+            conn.createStatement().execute(
+                "INSERT INTO DB_PROCEDURES VALUES " +
+                    "('APP_USER', 'P_SYNC', NULL, 'PROCEDURE', 'src'), ('APP_USER', 'P_SYNC', NULL, 'PROCEDURE', 'src'), " +
+                    "('APP_USER', 'F_CALC', NULL, 'FUNCTION', 'src'), ('APP_USER', 'T_SPEC', NULL, 'TYPE SPEC', 'src')"
+            );
+            conn.createStatement().execute("INSERT INTO DB_SEQUENCES VALUES ('APP_USER', 'SEQ_ORDERS')");
+
+            // DB_SYNONYMS is absent here: optional object kinds must not hide tables.
+            JsonNode result = (JsonNode) method.invoke(null, conn, "APP_USER", "APP_USER");
+            List<String> entries = new ArrayList<>();
+            for (JsonNode node : result) {
+                entries.add(node.path("object_type").asText() + ":" + node.path("name").asText());
+                assertEquals("APP_USER", node.path("schema").asText());
+            }
+            assertEquals(
+                List.of("TABLE:ORDERS", "VIEW:V_ORDERS", "FUNCTION:F_CALC", "PROCEDURE:P_SYNC", "SEQUENCE:SEQ_ORDERS"),
+                entries
+            );
+            assertEquals("订单", result.path(0).path("comment").asText());
+        }
+    }
+
+    @Test
+    void zenithGetColumnsAndIndexesUseDictionaryViews() throws Exception {
+        Method getColumns = DbxJdbcPlugin.class.getDeclaredMethod("zenithGetColumns", Connection.class, String.class, String.class);
+        getColumns.setAccessible(true);
+        Method listIndexes = DbxJdbcPlugin.class.getDeclaredMethod("zenithListIndexes", Connection.class, String.class, String.class);
+        listIndexes.setAccessible(true);
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:dbx_zenith_columns;DB_CLOSE_DELAY=-1", "sa", "")) {
+            conn.createStatement().execute("CREATE TABLE DB_OBJECTS (OWNER VARCHAR(64), OBJECT_NAME VARCHAR(64), OBJECT_TYPE VARCHAR(16))");
+            conn.createStatement().execute(
+                "CREATE TABLE DB_TAB_COLUMNS (OWNER VARCHAR(64), TABLE_NAME VARCHAR(64), COLUMN_NAME VARCHAR(64), " +
+                    "DATA_TYPE VARCHAR(32), DATA_LENGTH INT, DATA_PRECISION INT, DATA_SCALE INT, CHAR_LENGTH INT, " +
+                    "NULLABLE VARCHAR(1), COLUMN_ID INT, DATA_DEFAULT VARCHAR(64), AUTO_INCREMENT VARCHAR(1))"
+            );
+            conn.createStatement().execute(
+                "CREATE TABLE DB_COL_COMMENTS (OWNER VARCHAR(64), TABLE_NAME VARCHAR(64), COLUMN_NAME VARCHAR(64), COMMENTS VARCHAR(128))"
+            );
+            conn.createStatement().execute(
+                "CREATE TABLE DB_INDEXES (OWNER VARCHAR(64), TABLE_NAME VARCHAR(64), INDEX_NAME VARCHAR(64), " +
+                    "IS_PRIMARY VARCHAR(1), IS_UNIQUE VARCHAR(1), COLUMNS VARCHAR(256))"
+            );
+            // DB_IND_COLUMNS has no OWNER column on Zenith.
+            conn.createStatement().execute(
+                "CREATE TABLE DB_IND_COLUMNS (INDEX_OWNER VARCHAR(64), INDEX_NAME VARCHAR(64), TABLE_OWNER VARCHAR(64), " +
+                    "TABLE_NAME VARCHAR(64), COLUMN_NAME VARCHAR(64), COLUMN_POSITION INT)"
+            );
+            conn.createStatement().execute("INSERT INTO DB_OBJECTS VALUES ('APP_USER', 'ORDERS', 'TABLE')");
+            // COLUMN_ID starts at 0 on Zenith.
+            conn.createStatement().execute(
+                "INSERT INTO DB_TAB_COLUMNS VALUES " +
+                    "('APP_USER', 'ORDERS', 'ORDER_ID', 'NUMBER', 22, 10, 0, 0, 'N', 0, NULL, 'N'), " +
+                    "('APP_USER', 'ORDERS', 'REGION_ID', 'BINARY_INTEGER', 4, NULL, NULL, 0, 'N', 1, NULL, 'N'), " +
+                    "('APP_USER', 'ORDERS', 'ORDER_NAME', 'VARCHAR', 400, NULL, NULL, 0, 'Y', 2, '''none'' ', 'N'), " +
+                    "('APP_USER', 'ORDERS', 'SEQ_NO', 'BIGINT', 8, NULL, NULL, 0, 'N', 3, NULL, 'Y')"
+            );
+            conn.createStatement().execute("INSERT INTO DB_COL_COMMENTS VALUES ('APP_USER', 'ORDERS', 'ORDER_NAME', '订单名称')");
+            conn.createStatement().execute(
+                "INSERT INTO DB_INDEXES VALUES " +
+                    "('APP_USER', 'ORDERS', 'IDX_ORDERS_PK', 'Y', 'Y', 'ORDER_ID, REGION_ID'), " +
+                    "('APP_USER', 'ORDERS', 'IDX_ORDERS_SEQ', 'N', 'N', 'SEQ_NO')"
+            );
+            conn.createStatement().execute(
+                "INSERT INTO DB_IND_COLUMNS VALUES " +
+                    "('APP_USER', 'IDX_ORDERS_PK', 'APP_USER', 'ORDERS', 'REGION_ID', 2), " +
+                    "('APP_USER', 'IDX_ORDERS_PK', 'APP_USER', 'ORDERS', 'ORDER_ID', 1), " +
+                    "('APP_USER', 'IDX_ORDERS_SEQ', 'APP_USER', 'ORDERS', 'SEQ_NO', 1)"
+            );
+
+            JsonNode columns = (JsonNode) getColumns.invoke(null, conn, "APP_USER", "orders");
+            assertEquals(4, columns.size());
+            assertEquals("ORDER_ID", columns.path(0).path("name").asText());
+            assertEquals("NUMBER", columns.path(0).path("data_type").asText());
+            assertEquals(10, columns.path(0).path("numeric_precision").asInt());
+            assertTrue(columns.path(0).path("is_primary_key").asBoolean());
+            assertTrue(columns.path(1).path("is_primary_key").asBoolean());
+            assertTrue(columns.path(1).path("character_maximum_length").isNull());
+            assertEquals("ORDER_NAME", columns.path(2).path("name").asText());
+            assertTrue(columns.path(2).path("is_nullable").asBoolean());
+            assertEquals(400, columns.path(2).path("character_maximum_length").asInt());
+            assertEquals("'none'", columns.path(2).path("column_default").asText());
+            assertEquals("订单名称", columns.path(2).path("comment").asText());
+            assertFalse(columns.path(3).path("is_primary_key").asBoolean());
+            assertEquals("auto_increment", columns.path(3).path("extra").asText());
+
+            JsonNode indexes = (JsonNode) listIndexes.invoke(null, conn, "APP_USER", "ORDERS");
+            assertEquals(2, indexes.size());
+            assertEquals("IDX_ORDERS_PK", indexes.path(0).path("name").asText());
+            assertTrue(indexes.path(0).path("is_primary").asBoolean());
+            assertTrue(indexes.path(0).path("is_unique").asBoolean());
+            assertEquals(List.of("ORDER_ID", "REGION_ID"), MAPPER.convertValue(indexes.path(0).path("columns"), List.class));
+            assertEquals("IDX_ORDERS_SEQ", indexes.path(1).path("name").asText());
+            assertFalse(indexes.path(1).path("is_unique").asBoolean());
+        }
+    }
+
+    @Test
+    void zenithObjectSourceReadsViewTextAndRoutineSource() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod(
+            "zenithObjectSource",
+            Connection.class,
+            String.class,
+            String.class,
+            String.class
+        );
+        method.setAccessible(true);
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:dbx_zenith_source;DB_CLOSE_DELAY=-1", "sa", "")) {
+            conn.createStatement().execute("CREATE TABLE DB_VIEWS (OWNER VARCHAR(64), VIEW_NAME VARCHAR(64), TEXT VARCHAR(256))");
+            conn.createStatement().execute(
+                "CREATE TABLE DB_PROCEDURES (OWNER VARCHAR(64), OBJECT_NAME VARCHAR(64), OBJECT_TYPE VARCHAR(16), SOURCE VARCHAR(256))"
+            );
+            conn.createStatement().execute("INSERT INTO DB_VIEWS VALUES ('APP_USER', 'V_ORDERS', 'SELECT SEQ_NO FROM ORDERS')");
+            conn.createStatement().execute(
+                "INSERT INTO DB_PROCEDURES VALUES ('APP_USER', 'F_CALC', 'FUNCTION', 'CREATE OR REPLACE FUNCTION F_CALC RETURN INT')"
+            );
+
+            JsonNode view = (JsonNode) method.invoke(null, conn, "APP_USER", "V_ORDERS", "VIEW");
+            assertEquals("CREATE OR REPLACE VIEW \"APP_USER\".\"V_ORDERS\" AS\nSELECT SEQ_NO FROM ORDERS", view.path("source").asText());
+            assertFalse(view.path("editable").asBoolean());
+
+            JsonNode function = (JsonNode) method.invoke(null, conn, "APP_USER", "F_CALC", "FUNCTION");
+            assertEquals("CREATE OR REPLACE FUNCTION F_CALC RETURN INT", function.path("source").asText());
+        }
+    }
+
+    @Test
+    void zenithIndexColumnListSplitsCommaSpaceSeparatedNames() {
+        assertEquals(List.of("ORDER_ID", "REGION_ID", "STATUS"), DbxJdbcPlugin.splitZenithIndexColumns("ORDER_ID, REGION_ID, STATUS"));
+        assertEquals(List.of(), DbxJdbcPlugin.splitZenithIndexColumns(null));
+    }
+
     private static void createPeopleTable() throws Exception {
         request("executeQuery", """
             {
